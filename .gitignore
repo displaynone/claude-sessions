@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Build output (make-deb.sh)
+dist/
+*.deb
+*.changes
+*.buildinfo
+
+# Runtime / scratch
+*.log
+*.pid
+*.tmp
+*.bak
+*.bak.*
+*.orig
+*.swp
+*~
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+
+# Local Claude Code files
+.claude/
+CLAUDE.local.md

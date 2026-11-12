@@ -1,0 +1,997 @@
+#!/usr/bin/python3 -I
+"""claude-sessions: Claude Code session status in the GNOME top bar.
+
+Subcommands:
+  claude-sessions [indicator]   start the top bar indicator (AppIndicator)
+  claude-sessions hook          entry point for Claude Code hooks (JSON on stdin)
+  claude-sessions status        list sessions in the terminal
+  claude-sessions clean         delete state files whose PID is gone
+  claude-sessions setup         register the hooks in ~/.claude/settings.json
+  claude-sessions unsetup       remove those hooks again
+  claude-sessions --version     print the version
+
+One file per session in ~/.local/state/claude-sessions/<session_id>.json.
+GTK imports are lazy: the `hook` subcommand only uses the stdlib so it starts
+in ~30 ms.
+"""
+
+import json
+import os
+import sys
+import time
+
+__version__ = "0.1.0"
+
+STATE_DIR = os.path.join(
+    os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+    "claude-sessions",
+)
+CLAUDE_SESSIONS_DIR = os.path.expanduser("~/.claude/sessions")
+CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
+CLAUDE_SETTINGS = os.path.expanduser("~/.claude/settings.json")
+
+# Hook events to register, with their timeout in seconds
+HOOK_EVENTS = {
+    "SessionStart": 5, "UserPromptSubmit": 5, "PreToolUse": 5, "PostToolUse": 5,
+    "PermissionRequest": 5, "Notification": 5, "Elicitation": 5,
+    "Stop": 5, "StopFailure": 5, "SessionEnd": 1,
+}
+HOOK_SUFFIX = "claude-sessions hook"
+PID_FILE = os.path.join(STATE_DIR, "indicator.pid")
+
+NAME_MAX = 40
+SUMMARY_MAX = 50
+
+STATES = ("waiting", "running", "done", "idle")
+TAG = {"waiting": "WAIT", "running": "RUN ", "done": "DONE", "idle": "IDLE"}
+# Symbolic theme icons (Yaru/Adwaita) used in the bar and in menus
+STATE_ICON = {
+    "waiting": "dialog-question-symbolic",
+    "running": "emblem-synchronizing-symbolic",
+    "done": "emblem-ok-symbolic",
+    "idle": "media-playback-pause-symbolic",
+}
+# Badge colour drawn over the Claude glyph (used for desktop notifications)
+BADGE_COLOR = {
+    "waiting": (0.86, 0.20, 0.18),
+    "running": (0.20, 0.52, 0.89),
+    "done": (0.24, 0.66, 0.36),
+    "idle": (0.55, 0.55, 0.55),
+}
+CLAUDE_ORANGE = (0.85, 0.47, 0.34)  # #D97757
+ICON_DIR = os.path.join(STATE_DIR, "icons")
+
+# Claude glyph: Font Awesome Free 7 "claude" (brands), CC BY 4.0,
+# https://fontawesome.com/license/free
+CLAUDE_PATH = (
+    "M100.4 340.5l100.7-56.5 1.7-4.9-1.7-2.7-4.9 0-16.8-1-57.5-1.6-49.9-2.1-48.3-2.6"
+    "-12.2-2.6-11.4-15 1.2-7.5 10.2-6.9 14.7 1.3c18.9 1.3 45.9 3.1 81 5.6l35.2 2.1 52.2"
+    " 5.4 8.3 0 1.2-3.4-2.8-2.1-2.2-2.1-50.3-34.1-54.4-36-28.5-20.7-15.4-10.5-7.8-9.8"
+    "-3.4-21.5 14-15.4 18.8 1.3 4.8 1.3 19 14.7 40.7 31.5 53.1 39.1 7.8 6.5 3.1-2.2 .4"
+    "-1.6-3.5-5.8-28.9-52.2-30.8-53.1-13.7-22-3.6-13.2c-1.3-5.4-2.2-10-2.2-15.5l15.9"
+    "-21.6 8.8-2.8 21.2 2.8 8.9 7.8 13.2 30.2 21.4 47.5 33.2 64.6 9.7 19.2 5.2 17.8 1.9"
+    " 5.4 3.4 0 0-3.1 2.7-36.4 5-44.7 4.9-57.5 1.7-16.2 8-19.4 15.9-10.5 12.4 5.9 10.2"
+    " 14.7-1.4 9.5-6.1 39.5-11.9 61.9-7.8 41.5 4.5 0 5.2-5.2 21-27.8 35.2-44.1 15.5"
+    "-17.5 18.1-19.3 11.6-9.2 22 0 16.2 24.1-7.3 24.9-22.7 28.7-18.8 24.4-27 36.3-16.8"
+    " 29 1.6 2.3 4-.4 60.9-13 32.9-5.9 39.3-6.7 17.8 8.3 1.9 8.4-7 17.2-42 10.4-49.2"
+    " 9.8-73.3 17.3-.9 .7 1 1.3 33 3.1 14.1 .8 34.6 0 64.4 4.8 16.8 11.1 10.1 13.6-1.7"
+    " 10.4-25.9 13.2c-15.5-3.7-54.4-12.9-116.6-27.7l-28-7-3.9 0 0 2.3 23.3 22.8 42.7"
+    " 38.6 53.5 49.8 2.7 12.3-6.9 9.7-7.3-1-47-35.4-18.1-15.9-41.1-34.6-2.7 0 0 3.6 9.5"
+    " 13.9 50 75.2 2.6 23-3.6 7.5-13 4.5-14.2-2.6-29.3-41.1-30.2-46.3-24.4-41.5-3 1.7"
+    "-14.4 154.8-6.7 7.9-15.5 5.9-13-9.8-6.9-15.9 6.9-31.5 8.3-41.1 6.7-32.7 6.1-40.6"
+    " 3.6-13.5-.2-.9-3 .4-30.6 42-46.5 62.9-36.8 39.4-8.8 3.5-15.3-7.9 1.4-14.1 8.5"
+    "-12.6 50.9-64.8 30.7-40.2 19.8-23.2-.1-3.4-1.2 0-135.3 87.8-24.1 3.1-10.4-9.7 1.3"
+    "-15.9 4.9-5.2 40.7-28-.1 .1 0 .1z"
+)
+DEFAULT_SUMMARY = {
+    "waiting": "needs your attention",
+    "running": "working",
+    "done": "all done",
+    "idle": "no activity",
+}
+
+# Notification types that do NOT mean "waiting for the user".
+IGNORED_NOTIFICATIONS = {
+    "idle_prompt",
+    "auth_success",
+    "auth_storage_failure",
+    "elicitation_complete",
+    "elicitation_response",
+    "agent_completed",
+    "quota_auto_resume_fired",
+    "quota_auto_resume_stale",
+    "quota_auto_resume_disabled",
+}
+
+# Tools whose PreToolUse means Claude is blocked waiting for an answer.
+WAITING_TOOLS = {"AskUserQuestion", "ExitPlanMode"}
+
+
+# --------------------------------------------------------------------------
+# Shared helpers
+# --------------------------------------------------------------------------
+
+def truncate(text, limit):
+    text = " ".join(str(text or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def message_summary(text):
+    """First meaningful line of an assistant message, markdown stripped.
+
+    Skips fenced code blocks, tables and rules; uses a heading only when the
+    message has no body line.
+    """
+    heading = ""
+    in_code = False
+    for line in str(text or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_code = not in_code
+            continue
+        if in_code or not stripped or stripped.startswith(("|", "---", "***")):
+            continue
+        is_heading = stripped.startswith("#")
+        clean = stripped.lstrip("#>-*• ").replace("**", "").replace("`", "").strip()
+        if not clean:
+            continue
+        if is_heading:
+            heading = heading or clean
+            continue
+        return clean
+    return heading
+
+
+def pid_alive(pid):
+    """True if the PID exists and is still a `claude` process."""
+    if not pid:
+        return False
+    try:
+        with open(f"/proc/{pid}/comm") as fh:
+            return fh.read().strip() == "claude"
+    except OSError:
+        return False
+
+
+def indicator_pid():
+    """PID of the running indicator according to the pidfile, or None."""
+    try:
+        with open(PID_FILE) as fh:
+            pid = int(fh.read().strip())
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            argv = fh.read().split(b"\0")
+        if b"indicator" in argv and any(a.endswith(b"claude-sessions") for a in argv):
+            return pid
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def read_json(path):
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def write_json_atomic(path, data):
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as fh:
+        json.dump(data, fh, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def list_sessions():
+    """Return [(path, data)] for every valid state file."""
+    out = []
+    try:
+        names = os.listdir(STATE_DIR)
+    except OSError:
+        return out
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(STATE_DIR, name)
+        data = read_json(path)
+        if isinstance(data, dict) and data.get("session_id"):
+            out.append((path, data))
+    return out
+
+
+def remove_dead(sessions):
+    """Delete files whose PID is gone. Return the live sessions."""
+    alive = []
+    for path, data in sessions:
+        if pid_alive(data.get("pid")):
+            alive.append((path, data))
+        else:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    return alive
+
+
+def sort_key(data):
+    """Stable order by session start time (oldest first)."""
+    return (data.get("started_at") or data.get("updated_at") or 0, data.get("session_id") or "")
+
+
+# --------------------------------------------------------------------------
+# hook
+# --------------------------------------------------------------------------
+
+def git_branch(cwd):
+    """Current branch read straight from .git/HEAD (no subprocess). '' if none."""
+    d = cwd
+    for _ in range(40):
+        dotgit = os.path.join(d, ".git")
+        if os.path.isdir(dotgit):
+            head = os.path.join(dotgit, "HEAD")
+            break
+        if os.path.isfile(dotgit):  # worktree / submodule: "gitdir: <path>"
+            try:
+                with open(dotgit) as fh:
+                    line = fh.read().strip()
+            except OSError:
+                return ""
+            if not line.startswith("gitdir:"):
+                return ""
+            gitdir = line[7:].strip()
+            if not os.path.isabs(gitdir):
+                gitdir = os.path.join(d, gitdir)
+            head = os.path.join(gitdir, "HEAD")
+            break
+        parent = os.path.dirname(d)
+        if parent == d:
+            return ""
+        d = parent
+    else:
+        return ""
+    try:
+        with open(head) as fh:
+            ref = fh.read().strip()
+    except OSError:
+        return ""
+    if ref.startswith("ref: refs/heads/"):
+        return ref[len("ref: refs/heads/"):]
+    return ref[:7]  # detached HEAD
+
+
+def derive_name(cwd, session_title):
+    """Fallback name: custom title, else cwd basename plus @branch."""
+    if session_title:
+        return truncate(session_title, NAME_MAX)
+    base = os.path.basename(cwd.rstrip("/")) or cwd
+    branch = git_branch(cwd)
+    if branch and branch not in ("main", "master"):
+        name = f"{base}@{branch}"
+    else:
+        name = base
+    if len(name) <= NAME_MAX:
+        return name
+    # Trim the branch first so the directory name survives
+    if branch and branch not in ("main", "master"):
+        room = NAME_MAX - len(base) - 1
+        if room >= 4:
+            return f"{base}@{branch[: room - 1]}…"
+    return truncate(name, NAME_MAX)
+
+
+def find_pid(session_id):
+    """(pid, started_at) of the claude process owning this session.
+
+    1) Claude Code's internal registry (~/.claude/sessions/<pid>.json), not
+       documented but present in 2.1.x; it also carries the start time.
+    2) Walk up the process tree from this hook until a `claude` process is
+       found, taking its start time from /proc.
+    """
+    try:
+        for name in os.listdir(CLAUDE_SESSIONS_DIR):
+            if not name.endswith(".json") or "." in name[:-5]:
+                continue
+            data = read_json(os.path.join(CLAUDE_SESSIONS_DIR, name))
+            if data and data.get("sessionId") == session_id:
+                pid = int(data.get("pid") or 0)
+                if pid_alive(pid):
+                    started = data.get("startedAt")
+                    return pid, (started / 1000.0 if started else process_start(pid))
+    except OSError:
+        pass
+    pid = os.getppid()
+    for _ in range(10):
+        if pid <= 1:
+            break
+        try:
+            with open(f"/proc/{pid}/comm") as fh:
+                comm = fh.read().strip()
+            if comm == "claude":
+                return pid, process_start(pid)
+            with open(f"/proc/{pid}/stat") as fh:
+                pid = int(fh.read().split(")")[-1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    return None, None
+
+
+def process_start(pid):
+    """Process start time (epoch seconds) from /proc, or None."""
+    try:
+        with open(f"/proc/{pid}/stat") as fh:
+            start_ticks = int(fh.read().split(")")[-1].split()[19])
+        with open("/proc/uptime") as fh:
+            uptime = float(fh.read().split()[0])
+        hz = os.sysconf("SC_CLK_TCK")
+        return time.time() - uptime + start_ticks / hz
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def tool_detail(tool_name, tool_input):
+    """Short description of the tool in use."""
+    ti = tool_input if isinstance(tool_input, dict) else {}
+    if tool_name == "Bash":
+        return f"$ {ti.get('description') or ti.get('command') or ''}"
+    if tool_name in ("Read", "Edit", "Write", "MultiEdit", "NotebookEdit"):
+        path = ti.get("file_path") or ti.get("notebook_path") or ""
+        return f"{tool_name} {os.path.basename(path)}".strip()
+    if tool_name in ("Grep", "Glob"):
+        return f"{tool_name} {ti.get('pattern') or ''}".strip()
+    if tool_name in ("WebFetch", "WebSearch"):
+        return f"{tool_name} {ti.get('url') or ti.get('query') or ''}".strip()
+    if tool_name in ("Agent", "Task"):
+        return f"agent: {ti.get('description') or ''}".strip()
+    if tool_name == "Skill":
+        return f"/{ti.get('skill') or ''}"
+    if tool_name == "AskUserQuestion":
+        qs = ti.get("questions") or []
+        if qs and isinstance(qs[0], dict):
+            return qs[0].get("question") or "question"
+        return "question"
+    if tool_name == "ExitPlanMode":
+        return "plan ready for approval"
+    if tool_name.startswith("mcp__"):  # mcp__<server>__<tool>
+        parts = tool_name.split("__", 2)
+        if len(parts) == 3:
+            return f"{parts[1]}: {parts[2]}"
+    return tool_name or "tool"
+
+
+def compute_update(event, payload, prev):
+    """Return (state, summary), or None when the event changes nothing."""
+    tool = payload.get("tool_name") or ""
+    tool_input = payload.get("tool_input")
+
+    if event == "SessionStart":
+        return "idle", DEFAULT_SUMMARY["idle"]
+
+    if event == "UserPromptSubmit":
+        return "running", payload.get("prompt") or DEFAULT_SUMMARY["running"]
+
+    if event == "PreToolUse":
+        if tool in WAITING_TOOLS:
+            return "waiting", tool_detail(tool, tool_input)
+        return "running", tool_detail(tool, tool_input)
+
+    if event in ("PostToolUse", "PostToolUseFailure"):
+        return "running", tool_detail(tool, tool_input)
+
+    if event == "PermissionRequest":
+        return "waiting", f"permission: {tool_detail(tool, tool_input)}"
+
+    if event == "Notification":
+        ntype = payload.get("notification_type") or ""
+        if ntype in IGNORED_NOTIFICATIONS:
+            return None
+        if ntype == "permission_prompt" and prev.get("state") == "waiting":
+            return None  # PermissionRequest already set a better summary
+        return "waiting", payload.get("message") or payload.get("title") or ntype
+
+    if event == "Elicitation":
+        server = payload.get("mcp_server_name") or "MCP"
+        return "waiting", f"{server}: {payload.get('message') or 'question'}"
+
+    if event == "Stop":
+        # Show how Claude's last message starts, e.g. "Still waiting for job 4583238."
+        return "done", message_summary(payload.get("last_assistant_message")) or DEFAULT_SUMMARY["done"]
+
+    if event == "StopFailure":
+        err = payload.get("error") or message_summary(payload.get("last_assistant_message")) or "error"
+        return "waiting", f"error: {err}"
+
+    return None
+
+
+def cmd_hook():
+    try:
+        raw = sys.stdin.read()
+        payload = json.loads(raw) if raw.strip() else {}
+        if not isinstance(payload, dict):
+            return
+        session_id = payload.get("session_id")
+        event = payload.get("hook_event_name")
+        if not session_id or not event:
+            return
+        os.makedirs(STATE_DIR, exist_ok=True)
+        path = os.path.join(STATE_DIR, f"{session_id}.json")
+
+        if event == "SessionEnd":
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            return
+
+        prev = read_json(path) or {}
+        update = compute_update(event, payload, prev)
+        if update is None:
+            return
+        state, summary = update
+
+        cwd = payload.get("cwd") or prev.get("cwd") or os.getcwd()
+        title = payload.get("session_title") or prev.get("session_title") or ""
+        pid = prev.get("pid") if pid_alive(prev.get("pid")) else None
+        started_at = prev.get("started_at")
+        if pid is None or not started_at:
+            found_pid, found_start = find_pid(session_id)
+            pid = pid or found_pid
+            started_at = started_at or found_start or time.time()
+
+        data = {
+            "session_id": session_id,
+            "state": state,
+            "summary": truncate(summary, SUMMARY_MAX),
+            "cwd": cwd,
+            "name": derive_name(cwd, title),
+            "session_title": title,
+            "transcript_path": payload.get("transcript_path") or prev.get("transcript_path") or "",
+            "pid": pid,
+            "started_at": started_at,
+            "event": event,
+            "updated_at": time.time(),
+        }
+        write_json_atomic(path, data)
+    except Exception:  # noqa: BLE001 - never disturb the session
+        pass
+
+
+# --------------------------------------------------------------------------
+# Session names / status / clean
+# --------------------------------------------------------------------------
+
+_TITLE_CACHE = {}  # path -> (mtime, size, title)
+
+
+def transcript_title(path):
+    """Session title from its transcript (Claude Code internal format).
+
+    Looks for the last `custom-title` line (/rename) and, failing that, the
+    last `ai-title` line (the generated title shown in the terminal). Reads
+    only the tail of the file; if nothing is there, the whole file. Returns
+    '' when there is no title.
+    """
+    import re
+    try:
+        st = os.stat(path)
+    except OSError:
+        return ""
+    cached = _TITLE_CACHE.get(path)
+    if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+        return cached[2]
+
+    def find(data):
+        for key in ("customTitle", "aiTitle"):
+            hits = re.findall(rb'"' + key.encode() + rb'":"((?:[^"\\]|\\.)*)"', data)
+            if hits:
+                try:
+                    return json.loads('"' + hits[-1].decode("utf-8", "replace") + '"')
+                except ValueError:
+                    continue
+        return ""
+
+    title = ""
+    try:
+        with open(path, "rb") as fh:
+            tail = 262144
+            if st.st_size > tail:
+                fh.seek(st.st_size - tail)
+            title = find(fh.read())
+            if not title and st.st_size > tail:
+                fh.seek(0)
+                title = find(fh.read())
+    except OSError:
+        pass
+    _TITLE_CACHE[path] = (st.st_mtime, st.st_size, title)
+    return title
+
+
+def find_transcript(session_id):
+    """Locate the transcript under ~/.claude/projects (older state files)."""
+    try:
+        for proj in os.listdir(CLAUDE_PROJECTS_DIR):
+            cand = os.path.join(CLAUDE_PROJECTS_DIR, proj, f"{session_id}.jsonl")
+            if os.path.isfile(cand):
+                return cand
+    except OSError:
+        pass
+    return ""
+
+
+def display_name(d):
+    """Name to show: /rename > title generated by Claude Code > cwd@branch."""
+    if d.get("session_title"):
+        return truncate(d["session_title"], NAME_MAX)
+    path = d.get("transcript_path") or find_transcript(d.get("session_id") or "")
+    title = transcript_title(path) if path else ""
+    return truncate(title, NAME_MAX) if title else (d.get("name") or "?")
+
+
+def registry_start_times():
+    """{sessionId: started_at} from Claude Code's internal registry."""
+    out = {}
+    try:
+        for name in os.listdir(CLAUDE_SESSIONS_DIR):
+            if name.endswith(".json") and "." not in name[:-5]:
+                data = read_json(os.path.join(CLAUDE_SESSIONS_DIR, name))
+                if data and data.get("sessionId") and data.get("startedAt"):
+                    out[data["sessionId"]] = data["startedAt"] / 1000.0
+    except OSError:
+        pass
+    return out
+
+
+def disambiguate(sessions):
+    """Add ·1, ·2 suffixes to duplicate names. Return a sorted list of dicts."""
+    # State files written before started_at existed: fill from the registry
+    if any(not d.get("started_at") for _, d in sessions):
+        starts = registry_start_times()
+        for _, d in sessions:
+            if not d.get("started_at"):
+                d["started_at"] = starts.get(d.get("session_id")) or d.get("updated_at")
+    by_name = {}
+    for _, data in sessions:
+        by_name.setdefault(display_name(data), []).append(data)
+    out = []
+    for name, group in by_name.items():
+        group.sort(key=sort_key)
+        for i, data in enumerate(group):
+            d = dict(data)
+            d["label"] = name if len(group) == 1 else f"{name}·{i + 1}"
+            out.append(d)
+    out.sort(key=sort_key)
+    return out
+
+
+def cmd_status():
+    sessions = disambiguate(remove_dead(list_sessions()))
+    if not sessions:
+        print("No Claude Code sessions registered.")
+        return
+    for d in sessions:
+        age = int(time.time() - (d.get("updated_at") or time.time()))
+        print(f"{TAG[d['state']]} [{d['label']}] {d.get('summary') or ''}  "
+              f"(pid {d.get('pid')}, {age}s ago, {d.get('cwd')})")
+
+
+def cmd_clean():
+    before = list_sessions()
+    alive = remove_dead(before)
+    print(f"Removed {len(before) - len(alive)} dead sessions, {len(alive)} alive.")
+
+
+# --------------------------------------------------------------------------
+# setup / unsetup (hooks in ~/.claude/settings.json)
+# --------------------------------------------------------------------------
+
+def this_executable():
+    """Absolute path of this command, as hooks should invoke it."""
+    argv0 = sys.argv[0] if sys.argv else ""
+    if argv0 and os.path.sep in argv0:
+        return os.path.abspath(argv0)
+    import shutil
+    return shutil.which("claude-sessions") or os.path.abspath(argv0 or __file__)
+
+
+def is_our_hook(h):
+    return h.get("type") == "command" and str(h.get("command", "")).endswith(HOOK_SUFFIX)
+
+
+def load_settings():
+    if os.path.exists(CLAUDE_SETTINGS) and os.path.getsize(CLAUDE_SETTINGS) > 0:
+        with open(CLAUDE_SETTINGS) as fh:
+            return json.load(fh)
+    return {}
+
+
+def save_settings(settings, backup=True):
+    import shutil
+    os.makedirs(os.path.dirname(CLAUDE_SETTINGS), exist_ok=True)
+    if backup and os.path.exists(CLAUDE_SETTINGS):
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        shutil.copy2(CLAUDE_SETTINGS, f"{CLAUDE_SETTINGS}.bak.{stamp}")
+    tmp = CLAUDE_SETTINGS + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(settings, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+    os.replace(tmp, CLAUDE_SETTINGS)
+
+
+def hooks_status(settings, cmd):
+    """(events pointing at cmd, events pointing at another/missing claude-sessions)."""
+    ours, stale = [], []
+    for event in HOOK_EVENTS:
+        for g in settings.get("hooks", {}).get(event, []):
+            for h in g.get("hooks", []):
+                if is_our_hook(h):
+                    (ours if h["command"] == cmd else stale).append(event)
+    return ours, stale
+
+
+def cmd_setup(quiet=False):
+    """Merge our hooks into settings.json (keeps everything else, backs up)."""
+    cmd = f"{this_executable()} hook"
+    settings = load_settings()
+    hooks = settings.setdefault("hooks", {})
+    changed = []
+    for event, timeout in HOOK_EVENTS.items():
+        groups = hooks.setdefault(event, [])
+        present = False
+        for g in groups:
+            for h in g.get("hooks", []):
+                if is_our_hook(h):
+                    if h["command"] != cmd:  # moved install: repoint it
+                        h["command"] = cmd
+                        changed.append(event)
+                    present = True
+        if not present:
+            groups.append({"hooks": [{"type": "command", "command": cmd, "timeout": timeout}]})
+            changed.append(event)
+    if changed:
+        save_settings(settings)
+    if not quiet:
+        print(f"Hook command: {cmd}")
+        print("Hooks registered:", ", ".join(sorted(set(changed))) if changed else "none (already up to date)")
+    return 0
+
+
+def cmd_unsetup():
+    """Remove only the hooks whose command ends in 'claude-sessions hook'."""
+    settings = load_settings()
+    hooks = settings.get("hooks") or {}
+    removed = 0
+    for event in list(hooks):
+        groups = []
+        for g in hooks[event]:
+            kept = [h for h in g.get("hooks", []) if not is_our_hook(h)]
+            removed += len(g.get("hooks", [])) - len(kept)
+            if kept:
+                g["hooks"] = kept
+                groups.append(g)
+        if groups:
+            hooks[event] = groups
+        else:
+            del hooks[event]
+    if not hooks:
+        settings.pop("hooks", None)
+    if removed:
+        save_settings(settings)
+    print(f"Hooks removed: {removed}")
+    return 0
+
+
+def ensure_hooks():
+    """Register hooks silently if missing or pointing elsewhere (indicator start)."""
+    try:
+        ours, stale = hooks_status(load_settings(), f"{this_executable()} hook")
+        if len(set(ours)) < len(HOOK_EVENTS) or stale:
+            cmd_setup(quiet=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Could not register hooks: {exc}", file=sys.stderr)
+
+
+# --------------------------------------------------------------------------
+# Icons
+# --------------------------------------------------------------------------
+
+def icon_name(state):
+    """Bar icon name for a state ('none' = plain Claude glyph)."""
+    return f"claude-sessions-{state or 'none'}"
+
+
+def render_icons(size=64):
+    """Render one PNG per state into ICON_DIR: Claude glyph plus colour badge.
+
+    The plain glyph is the bar icon; the badged ones are used for desktop
+    notifications. Returns ICON_DIR, or None when cairo/rsvg are unavailable
+    (the indicator then falls back to a theme icon).
+    """
+    try:
+        import cairo
+        import gi
+        gi.require_version("Rsvg", "2.0")
+        from gi.repository import Rsvg
+    except (ImportError, ValueError):
+        return None
+    os.makedirs(ICON_DIR, exist_ok=True)
+    r, g, b = CLAUDE_ORANGE
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">'
+        f'<path fill="rgb({int(r*255)},{int(g*255)},{int(b*255)})" d="{CLAUDE_PATH}"/>'
+        "</svg>"
+    ).encode()
+    handle = Rsvg.Handle.new_from_data(svg)
+    for state in list(STATES) + [None]:
+        path = os.path.join(ICON_DIR, icon_name(state) + ".png")
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
+        cr = cairo.Context(surface)
+        # Glyph fills ~86% of the canvas, bottom-left, leaving room for a badge
+        glyph = size * 0.86
+        rect = Rsvg.Rectangle()
+        rect.x, rect.y, rect.width, rect.height = 0, size - glyph, glyph, glyph
+        handle.render_document(cr, rect)
+        if state:
+            br, bg, bb = BADGE_COLOR[state]
+            radius = size * 0.20
+            cx, cy = size - radius - 1, radius + 1
+            # Dark outline so the badge separates from the glyph on any background
+            cr.set_source_rgba(0.12, 0.12, 0.12, 0.9)
+            cr.arc(cx, cy, radius + size * 0.03, 0, 6.2832)
+            cr.fill()
+            cr.set_source_rgb(br, bg, bb)
+            cr.arc(cx, cy, radius, 0, 6.2832)
+            cr.fill()
+            if state == "waiting":  # white question mark
+                cr.set_source_rgb(1, 1, 1)
+                cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+                cr.set_font_size(radius * 1.6)
+                ext = cr.text_extents("?")
+                cr.move_to(cx - ext.width / 2 - ext.x_bearing, cy + ext.height / 2)
+                cr.show_text("?")
+        surface.flush()
+        surface.write_to_png(path)
+    return ICON_DIR
+
+
+# --------------------------------------------------------------------------
+# Indicator
+# --------------------------------------------------------------------------
+
+def cmd_indicator():
+    import gi
+    import subprocess
+    import warnings
+
+    warnings.filterwarnings("ignore", category=DeprecationWarning)  # ImageMenuItem in GTK3
+
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("AyatanaAppIndicator3", "0.1")
+    from gi.repository import AyatanaAppIndicator3 as AppIndicator
+    from gi.repository import Gio, GLib, Gtk
+
+    POLL_SECONDS = 5
+    # Maximum number of session icons in the bar. The GNOME extension inserts
+    # every new icon at the left and cannot reorder or drop items while the
+    # process lives, so all slots are created at startup (in reverse order)
+    # and the sorted sessions are assigned to slots 1..N. Slot 0 is Claude.
+    SLOTS = int(os.environ.get("CLAUDE_SESSIONS_SLOTS") or 12)
+    os.makedirs(STATE_DIR, exist_ok=True)
+
+    # Single instance (autostart and install.sh may race)
+    other = indicator_pid()
+    if other and other != os.getpid():
+        print(f"An indicator is already running (pid {other})", file=sys.stderr)
+        return 0
+    with open(PID_FILE, "w") as fh:
+        fh.write(str(os.getpid()))
+    if os.environ.get("CLAUDE_SESSIONS_NO_SETUP") != "1":
+        ensure_hooks()
+
+    def icon_item(text, icon):
+        item = Gtk.ImageMenuItem(label=text)
+        if icon:
+            item.set_image(Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.MENU))
+            item.set_always_show_image(True)
+        return item
+
+    class Slot:
+        """A fixed AppIndicator in the bar: Claude (slot 0) or one session."""
+
+        def __init__(self, index, app):
+            self.index = index
+            self.app = app
+            self.session_id = None
+            self.icon = None
+            ident = f"claude-sessions-{index:02d}"
+            if index == 0 and app.icon_dir:
+                self.ind = AppIndicator.Indicator.new_with_path(
+                    ident, icon_name(None),
+                    AppIndicator.IndicatorCategory.APPLICATION_STATUS, app.icon_dir)
+            else:
+                self.ind = AppIndicator.Indicator.new(
+                    ident, "utilities-terminal-symbolic" if index == 0 else STATE_ICON["idle"],
+                    AppIndicator.IndicatorCategory.APPLICATION_STATUS)
+            self.ind.set_title("Claude Code")
+            self.ind.set_label("", "")
+            self.menu = Gtk.Menu()
+            self.ind.set_menu(self.menu)
+            self.ind.set_status(AppIndicator.IndicatorStatus.PASSIVE)
+
+        def hide(self):
+            self.session_id = None
+            self.ind.set_status(AppIndicator.IndicatorStatus.PASSIVE)
+
+        def set_icon(self, icon, desc):
+            if icon != self.icon:
+                self.icon = icon
+                self.ind.set_icon_full(icon, desc)
+
+        def clear_menu(self):
+            for child in self.menu.get_children():
+                self.menu.remove(child)
+
+        def show_claude(self, sessions):
+            """Slot 0: Claude glyph with the global menu."""
+            self.clear_menu()
+            if not sessions:
+                item = Gtk.MenuItem(label="No Claude Code sessions")
+                item.set_sensitive(False)
+                self.menu.append(item)
+            for d in sessions:
+                item = icon_item(f"[{d['label']}] {d.get('summary') or ''}", STATE_ICON[d["state"]])
+                item.set_tooltip_text(d.get("cwd") or "")
+                item.connect("activate", self.app.copy_cwd, d)
+                self.menu.append(item)
+            self.menu.append(Gtk.SeparatorMenuItem())
+            item = icon_item("Clean up dead sessions", "edit-clear-all-symbolic")
+            item.connect("activate", lambda *_: self.app.refresh())
+            self.menu.append(item)
+            item = icon_item("Quit", "application-exit-symbolic")
+            item.connect("activate", lambda *_: Gtk.main_quit())
+            self.menu.append(item)
+            self.menu.show_all()
+            self.ind.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+
+        def show_session(self, d):
+            """Slots 1..N: state icon of one session."""
+            self.session_id = d["session_id"]
+            self.set_icon(STATE_ICON[d["state"]], f"Claude Code [{d['label']}]: {d['state']}")
+            self.clear_menu()
+            item = icon_item(f"[{d['label']}] {d.get('summary') or ''}", STATE_ICON[d["state"]])
+            item.connect("activate", self.app.copy_cwd, d)
+            self.menu.append(item)
+            item = Gtk.MenuItem(label=d.get("cwd") or "")
+            item.set_sensitive(False)
+            self.menu.append(item)
+            self.menu.show_all()
+            self.ind.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+
+    class Indicator:
+        def __init__(self):
+            self.icon_dir = render_icons()
+            self.slots = []
+            self.last_states = {}  # session_id -> state, to notify transitions once
+            self.refresh_pending = False
+            # Create slots last to first, spaced out, so the extension inserts
+            # them in order: Claude (0) leftmost, then one per session.
+            self.pending_slots = list(range(SLOTS, -1, -1))
+            GLib.timeout_add(40, self.create_next_slot)
+
+        def create_next_slot(self):
+            if not self.pending_slots:
+                self.slots.sort(key=lambda sl: sl.index)
+                self.monitor = Gio.File.new_for_path(STATE_DIR).monitor_directory(
+                    Gio.FileMonitorFlags.NONE, None)
+                self.monitor.connect("changed", self.on_dir_changed)
+                GLib.timeout_add_seconds(POLL_SECONDS, self.on_poll)
+                self.refresh()
+                return False
+            self.slots.append(Slot(self.pending_slots.pop(0), self))
+            return True
+
+        # Coalesce bursts of file changes into a single refresh
+        def on_dir_changed(self, *_):
+            if not self.refresh_pending:
+                self.refresh_pending = True
+                GLib.timeout_add(150, self.refresh_debounced)
+
+        def refresh_debounced(self):
+            self.refresh_pending = False
+            self.refresh()
+            return False
+
+        def on_poll(self):
+            self.refresh()
+            return True
+
+        def refresh(self):
+            sessions = disambiguate(remove_dead(list_sessions()))
+            self.notify_transitions(sessions)
+            self.slots[0].show_claude(sessions)
+            for i, slot in enumerate(self.slots[1:]):
+                if i < len(sessions):
+                    slot.show_session(sessions[i])
+                else:
+                    slot.hide()
+
+        def notify_transitions(self, sessions):
+            current = {}
+            for d in sessions:
+                sid = d["session_id"]
+                current[sid] = d["state"]
+                if d["state"] == "waiting" and self.last_states.get(sid) != "waiting":
+                    self.notify(d)
+            self.last_states = current
+
+        def notify(self, d):
+            try:
+                subprocess.Popen(
+                    [
+                        "notify-send",
+                        "--app-name=Claude Code",
+                        "--icon=" + (os.path.join(self.icon_dir, icon_name("waiting") + ".png")
+                                     if self.icon_dir else "dialog-question"),
+                        "--urgency=normal",
+                        f"[{d['label']}] needs your attention",
+                        d.get("summary") or "",
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except OSError:
+                pass
+
+        def copy_cwd(self, _item, d):
+            # Copy the cwd to the clipboard: the most useful thing we can do
+            # since Wayland does not let us focus the terminal from outside.
+            try:
+                from gi.repository import Gdk
+                clip = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+                clip.set_text(d.get("cwd") or "", -1)
+                clip.store()
+            except Exception:  # noqa: BLE001
+                pass
+
+    Indicator()
+    try:
+        Gtk.main()
+    finally:
+        try:
+            if indicator_pid() == os.getpid():
+                os.unlink(PID_FILE)
+        except OSError:
+            pass
+    return 0
+
+
+# --------------------------------------------------------------------------
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else "indicator"
+    if cmd == "hook":
+        cmd_hook()
+    elif cmd == "indicator":
+        return cmd_indicator()
+    elif cmd == "status":
+        cmd_status()
+    elif cmd == "clean":
+        cmd_clean()
+    elif cmd == "setup":
+        return cmd_setup()
+    elif cmd == "unsetup":
+        return cmd_unsetup()
+    elif cmd in ("-V", "--version", "version"):
+        print(f"claude-sessions {__version__}")
+    elif cmd in ("-h", "--help", "help"):
+        print(__doc__.strip())
+    else:
+        print(f"Unknown subcommand: {cmd}", file=sys.stderr)
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv) or 0)

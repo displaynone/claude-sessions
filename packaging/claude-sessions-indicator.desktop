@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Claude Code sessions indicator
+Comment=Claude Code session status in the top bar
+Exec=/usr/bin/claude-sessions indicator
+Icon=utilities-terminal
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=5
+OnlyShowIn=GNOME;

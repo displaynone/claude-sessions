@@ -1,0 +1,70 @@
+name: Build .deb on tag
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  deb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0+$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Sanity checks
+        run: |
+          python3 -m py_compile claude-sessions
+          bash -n install.sh uninstall.sh make-deb.sh
+          echo '{}' | ./claude-sessions hook   # must not fail or print
+          ./claude-sessions --version
+
+      - name: Build package
+        env:
+          DEB_MAINTAINER: "${{ github.repository_owner }} <${{ github.repository_owner }}@users.noreply.github.com>"
+          DEB_HOMEPAGE: "${{ github.server_url }}/${{ github.repository }}"
+        run: ./make-deb.sh "${{ steps.ver.outputs.version }}"
+
+      - name: Inspect package
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq lintian >/dev/null
+          dpkg-deb --info dist/*.deb
+          dpkg-deb --contents dist/*.deb
+          lintian --no-tag-display-limit dist/*.deb || true
+
+      - name: Smoke test installation
+        run: |
+          sudo apt-get install -y -qq ./dist/*.deb
+          claude-sessions --version
+          claude-sessions status
+          HOME="$RUNNER_TEMP/h" claude-sessions setup
+          HOME="$RUNNER_TEMP/h" claude-sessions unsetup
+          test -f /etc/xdg/autostart/claude-sessions-indicator.desktop
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: claude-sessions-deb
+          path: dist/*.deb
+
+      - name: Publish GitHub release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/*.deb \
+            --title "claude-sessions ${GITHUB_REF_NAME}" \
+            --generate-notes
