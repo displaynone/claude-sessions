@@ -61,6 +61,9 @@ Font Awesome Free 7 (`brands/claude`, licensed
    runs `notify-send` the first time a session enters `waiting`.
 3. If a session's PID no longer exists (terminal closed without a
    `SessionEnd`), the indicator deletes its file.
+4. Live sessions without a state file yet (fresh install, or the state
+   directory was wiped) are listed from Claude Code's internal registry in
+   `~/.claude/sessions/` as running or idle until their first hook event.
 
 Event mapping:
 
@@ -106,9 +109,13 @@ dependencies. The hooks are per user, so they are registered in
 in your session, or right away with:
 
 ```bash
-claude-sessions setup      # register hooks for the current user
-claude-sessions indicator  # or log out and back in
+claude-sessions setup        # register hooks for the current user
+claude-sessions indicator &  # start it now; it autostarts at the next login
 ```
+
+Sessions that are already open show up right away: the indicator seeds them
+from Claude Code's own session registry (`~/.claude/sessions/`) until their
+first hook event arrives.
 
 To remove it: `claude-sessions unsetup` (drops the hooks from your
 settings.json), then `sudo apt remove claude-sessions`.
