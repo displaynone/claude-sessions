@@ -47,9 +47,13 @@ TAG = {"waiting": "WAIT", "running": "RUN ", "done": "DONE", "idle": "IDLE"}
 # Symbolic theme icons (Yaru/Adwaita) used in the bar and in menus
 STATE_ICON = {
     "waiting": "dialog-question-symbolic",
-    "running": "emblem-synchronizing-symbolic",
+    "running": "hourglass-symbolic",
     "done": "emblem-ok-symbolic",
     "idle": "media-playback-pause-symbolic",
+}
+# hourglass-symbolic is Yaru-only; fall back to these on other themes (Adwaita)
+ICON_FALLBACK = {
+    "hourglass-symbolic": ("timer-sand-symbolic", "content-loading-symbolic", "emblem-synchronizing-symbolic"),
 }
 # Badge colour drawn over the Claude glyph (used for desktop notifications)
 BADGE_COLOR = {
@@ -831,6 +835,15 @@ def cmd_indicator():
         fh.write(str(os.getpid()))
     if os.environ.get("CLAUDE_SESSIONS_NO_SETUP") != "1":
         ensure_hooks()
+
+    # Replace icons the current theme lacks with the first available fallback
+    theme = Gtk.IconTheme.get_default()
+    for state, name in list(STATE_ICON.items()):
+        if not theme.has_icon(name):
+            for alt in ICON_FALLBACK.get(name, ()):
+                if theme.has_icon(alt):
+                    STATE_ICON[state] = alt
+                    break
 
     def icon_item(text, icon):
         item = Gtk.ImageMenuItem(label=text)

@@ -29,11 +29,13 @@ from outside).
 | Icon (system theme)            | State   | Meaning                                                   |
 |--------------------------------|---------|-----------------------------------------------------------|
 | dialog-question-symbolic       | waiting | asking for permission, asking a question, plan to approve, API error |
-| emblem-synchronizing-symbolic  | running | running a tool or processing your prompt                  |
+| hourglass-symbolic             | running | running a tool or processing your prompt                  |
 | emblem-ok-symbolic             | done    | finished, waiting for your next message                   |
 | media-playback-pause-symbolic  | idle    | freshly started session, no activity yet                  |
 
 Icon names live in the `STATE_ICON` dictionary at the top of the executable.
+`hourglass-symbolic` ships with Yaru only; on other themes the indicator falls
+back to the first available name in `ICON_FALLBACK` (sand timer, loading dots).
 
 Bar ordering: the `ubuntu-appindicators` extension inserts every new icon at
 the left, ignores the ordering index, and only drops an item when its process
